@@ -195,6 +195,7 @@ local function new( t, ... )
 	local self = setmetatable({},{ __index = D })
 	
 	self.triggerOn = {}
+	self.wpm = 90
 	
 	coroutine.wrap( function() init( self, options ) end )()
 	
@@ -211,14 +212,12 @@ function init( self, options )
 		
 		self.headers[#self.headers + 1] = { "authorization",  data.token }
 		self.token = data.token
-		p( data )
 	end
 		
 	do -- find gateway
 		local head, data = http.request( api.gateway.method, api.gateway.endpoint(), self.headers )
 		data = json.decode( data )
 		self.gatewayUrl = data.url
-		p( data )
 	end
 	
 	do
@@ -289,7 +288,7 @@ function init( self, options )
 end
 
 function trigger(self,event,...)
-	local triggers = self.triggerOn[event]
+	local triggers = self.triggerOn[event] or {}
 	for i=1,#triggers do
 		triggers[i]( self, ...)
 	end
@@ -305,29 +304,22 @@ function D.on(self, event, callback)
 	self.triggerOn[event] = t
 end
 	
-	
-function D.sendMessage( self, channel, message )
-	local body = json.stringify(  { content = message } )
-	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )
-	return json.decode( data )
-end
-
-function D.fakeTyping( self, channel, message, shouldsend )
-	local sleep_time = 0
-	if message then
-		local wpm = 90
-		local time_per_keystroke = 1000 * ( 60 / (( wpm or 90 ) * 5 ) )		
-		sleep_time = #message * time_per_keystroke 
-	end
-	
+function D.fakeType( self, channel, sleep_time )
 	repeat
 		http.request( api.broadcast_typing.method, api.broadcast_typing.endpoint(channel), self.headers )
 		timer.sleep( math.min( 5000, sleep_time ) )
 		sleep_time = sleep_time - 5000
-	until sleep_time <= 0	
-	if shouldsend then
-		self:sendMessage( channel, message ) 
+	until sleep_time <= 0
+end
+	
+function D.sendMessage( self, channel, message, options )
+	if options and options.fakeType then
+		local typing_time = #message * ( 1000 * ( 60 / (( self.wpm or 90 ) * 5 ) ) ) 
+		self:fakeType( channel, typing_time )
 	end
+	local body = json.stringify(  { content = message } )
+	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )
+	return json.decode( data )
 end
 
 function D.setRoles( self, guild, user, roles )
