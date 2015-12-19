@@ -414,16 +414,16 @@ function D.sendMessage( self, channel, message, options )
 	end
 	local body = json.stringify(  { content = message } )
 	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )	
-	if head.code ~= 200 then
-		print( 'sendMessage response: ' .. head.code )
-	elseif head.code == 429 then
-		print 'rate limit hit'
-		local data = json.decode( data )		
-		timer.sleep( data['Retry-After'] )
+	
+	if head.code == 429 then
+		print( 'Rate limit hit. Sleeping for' .. data['retry_after'] .. 'ms.' )
+		data = json.decode( data  )
+		timer.sleep( data['retry_after'] )
 		return D.sendMessage( self, channel, message, options )
 	end
-	
-	return json.decode( data )
+
+	data = json.decode( data  )
+	return data
 end
 
 function scopy(t)
