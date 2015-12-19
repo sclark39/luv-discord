@@ -416,8 +416,8 @@ function D.sendMessage( self, channel, message, options )
 	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )	
 	
 	if head.code == 429 then
-		print( 'Rate limit hit. Sleeping for' .. data['retry_after'] .. 'ms.' )
 		data = json.decode( data  )
+		print( 'Rate limit hit. Sleeping for ' .. data['retry_after'] .. 'ms.' )
 		timer.sleep( data['retry_after'] )
 		return D.sendMessage( self, channel, message, options )
 	end
