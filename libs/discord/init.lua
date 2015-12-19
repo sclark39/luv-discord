@@ -6,6 +6,7 @@ exports.author = { name = "Skyler Clark" }
 exports.homepage = "https://github.com/sclark39/luv-discord"
 exports.dependencies = {
 	"luvit/json@2.5.1",
+	"luvit/querystring@1.0.2",
 	"luvit/utils@1.0.0-4",
 	"luvit/timer@1.0.0-4",
 	"creationix/coro-http@1.2.1-1",

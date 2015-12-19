@@ -2,6 +2,7 @@ local D = {}
 
 local uv = require('uv')
 local json = require('json')
+local querystring = require('querystring')
 local utils = require('utils')
 local timer = require('timer')
 
@@ -14,6 +15,7 @@ local DS = require('./datastore')
 local init
 local trigger
 
+local version = '0.0.1'
 local headers =
 {
 	{ "accept", "*/*" },
@@ -22,9 +24,12 @@ local headers =
 	{ "content-type", "application/json" },
 	{ "dnt", "1" },
 	{ "origin", "https://discordapp.com" },
-	{ "user-agent", "LuvitBot (luv-discord) }" }	
+	{ "user-agent", "DiscordBot (https://github.com/sclark39/luv-discord, v"..version..")" }	
 }
 
+local HTTP_CREATED = 201
+
+local wrap,yield,resume = coroutine.wrap, coroutine.yield, coroutine.resume
 
 local function EP( s )
 	local split, fill, lastj = {}, {}, 1
@@ -38,7 +43,7 @@ local function EP( s )
 	else
 		return function(...)
 			for i = 1,#fill do
-				split[fill[i]] = assert( select(i, ...) )
+				split[fill[i]] = assert( select(i, ...), "param "..i.." not found: "..s )
 			end
 			return table.concat(split,"")
 		end
@@ -52,6 +57,7 @@ local api =
 	
 	broadcast_typing = { method="POST", endpoint=EP("https://discordapp.com/api/channels/:channel_id/typing") },
 		
+	get_messages = { method = "GET", endpoint = EP("https://discordapp.com/api/channels/:channel_id/messages" ) },
 	send_message = { method = "POST", endpoint = EP("https://discordapp.com/api/channels/:channel_id/messages" ) },
 	edit_message = { method = "PATCH", endpoint = EP("https://discordapp.com/api/channels/:channel_id/messages/:id") },
 	delete_message = { method = "DELETE", endpoint = EP("https://discordapp.com/api/channels/:channel_id/messages/:id") },
@@ -105,6 +111,7 @@ local permissions = bit_enum{
 	VOICE_MOVE_MEMBERS = 24,
 	VOICE_USE_VAD = 25,
 }
+D.permissions = permissions
 
 
 local function noop() end
@@ -197,37 +204,62 @@ local function new( t, ... )
 	self.triggerOn = {}
 	self.wpm = 90
 	
-	coroutine.wrap( function() init( self, options ) end )()
+	local init = wrap( init )
+	self.threading = {
+		resume = init,
+		busy = false,
+		block = false,
+		yield = nil,
+	}
+	init( self, options )
 	
 	return self
 end
 
+function auth( self, options )
+	do -- auth
+		print 'Authenticating'
+		local body = json.stringify( { email = options.email, password = options.password } )
+		local head, data = http.request( api.login.method, api.login.endpoint(), self.headers, body )
+		data = json.decode( data )
+		self.headers[#self.headers] = { "authorization",  self.token }
+		self.token = data.token
+	end
+	
+	do -- find gateway
+		print 'Finding Gateway'
+		local head, data = http.request( api.gateway.method, api.gateway.endpoint(), self.headers )
+		data = json.decode( data )
+		self.gateway = data.url
+	end
+	
+	local f = io.output( "auth-cache.lua" )
+	f:write( string.format( "return '%s', '%s'", self.token, self.gateway ) )
+	f:close()
+end
+		
 function init( self, options )
 	self.headers = { { "content-type", "application/json" } }
 	
-	do -- auth
-		local body = json.stringify(  { email = options.email, password = options.password } )
-		local head, data = http.request( api.login.method, api.login.endpoint(), self.headers, body )
-		data = json.decode( data )
-		
-		self.headers[#self.headers + 1] = { "authorization",  data.token }
-		self.token = data.token
+	self.token, self.gateway = dofile( "auth-cache.lua" )
+	self.headers[#self.headers + 1] = { "authorization",  self.token }
+	
+	--[[if not socket:is_active() then
+		auth( self, options )
 	end
-		
-	do -- find gateway
-		local head, data = http.request( api.gateway.method, api.gateway.endpoint(), self.headers )
-		data = json.decode( data )
-		self.gatewayUrl = data.url
-	end
+	]]--
 	
 	do
-		local read, write, socket = websocket( self.gatewayUrl )
+		print 'Connecting'
+		local read, write, socket = websocket( self.gateway )
+		self.socket = socket
+		
 		write = wrapper.writer(write, function(item) return { opcode = 1, mask = true, payload = item } end ) -- must write using plain/text opcode and with mask enabled
 		write( json.stringify
 			{ 
 				op = 2, 
 				d = 
-				{ 
+				{
 					v = 3,
 					token = self.token, 
 					compress = false,
@@ -249,10 +281,15 @@ function init( self, options )
 		assert( data.d.heartbeat_interval )
 		
 		-- Heartbeat
-		local timer = uv.new_timer()
-		timer:start( data.d.heartbeat_interval, data.d.heartbeat_interval, function()
-			coroutine.wrap( function() write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) end )()
-		end )
+		timer.setInterval( data.d.heartbeat_interval, 
+			coroutine.wrap( function()
+					while true do
+						write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
+						yield()
+					end
+				end 
+			) 
+		)
 		
 		-- Parse data.
 		self.user = data.d.user
@@ -277,13 +314,49 @@ function init( self, options )
 		trigger( self, 'ready' )
 		
 		for message in read do
+			while self.threading.busy do 
+				print "waiting to read, busy"
+				self.threading.waiting = true
+				yield() 
+			end
+			self.threading.busy = true
+			
 			local data = json.decode( message.payload )
 			trigger( self, 'debug', data )
 			if data.d and ws_events[data.t] then
 				ws_events[ data.t ]( self, data.d )
-			end			
+			end
+						
+			self.threading.busy = false
+			if self.threading.yieldTo then
+				print "done working, yielding to..."
+				local coro = self.threading.yieldTo 
+				self.threading.yieldTo = nil
+				resume( coro )
+			end
 		end	
 		
+	end
+end
+
+
+function D.lock( self )
+	print "lock"
+	if self.threading.busy then
+		self.threading.yieldTo = coroutine.running()
+		print "yielding timer"
+		coroutine.yield()
+	end
+	self.threading.busy = true
+end
+
+function D.unlock( self )
+	print "unlock"
+	self.threading.busy = false
+	if self.threading.waiting then
+		self.threading.waiting = nil
+		print "resuming main"
+		self.threading.resume()
 	end
 end
 
@@ -311,15 +384,32 @@ function D.fakeType( self, channel, sleep_time )
 		sleep_time = sleep_time - 5000
 	until sleep_time <= 0
 end
-	
+
 function D.sendMessage( self, channel, message, options )
 	if options and options.fakeType then
 		local typing_time = #message * ( 1000 * ( 60 / (( self.wpm or 90 ) * 5 ) ) ) 
 		self:fakeType( channel, typing_time )
 	end
 	local body = json.stringify(  { content = message } )
-	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )
+	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )	
+	if head.code ~= 200 then
+		print( 'sendMessage response: ' .. head.code )
+	elseif head.code == 429 then
+		print 'rate limit hit'
+		local data = json.decode( data )		
+		timer.sleep( data['Retry-After'] )
+		return D.sendMessage( self, channel, message, options )
+	end
+	
 	return json.decode( data )
+end
+
+function scopy(t)
+	local r = {}
+	for k,v in pairs(t) do
+		r[k] = v
+	end
+	return r
 end
 
 function D.setRoles( self, guild, user, roles )
@@ -331,14 +421,38 @@ end
 function D.createChannel( self, guild, name, isVoice )
 	local body = json.stringify(  { name = name, type = isVoice and 'voice' or 'text' } )
 	local head, data = http.request( api.create_channel.method, api.create_channel.endpoint(guild), self.headers, body )
+	
+	data = json.decode( data )
+	if head.code == HTTP_CREATED then		
+		ws_events['CHANNEL_CREATE']( self, scopy( data ) )
+	end	
+	return data
+end
+
+function D.deleteChannel( self, channel )
+	local head, data = http.request( api.delete_channel.method, api.delete_channel.endpoint(channel), self.headers )
 	return json.decode( data )
 end
 
-function D.setPermissions( self, channel, target, isRole, allow, deny )
-	local body = json.stringify(  { id = target, type = isRole and 'role' or 'member', allow = allow, deny = deny } )
-	local head, data = http.request( api.set_permission.method, api.set_permission.endpoint(guild,channel), self.headers, body )
+function D.setPermissions( self, channel, target, allow, deny )
+	local gid = self:guildFromChannel( channel )
+	local targetType = self.guilds[gid].members[target] and 'member' or 'role'
+	local body = json.stringify(  { id = target, type = targetType, allow = allow, deny = deny } )
+	
+	local head, data = http.request( api.set_permission.method, api.set_permission.endpoint( channel, target ), self.headers, body )
+	p{ head = head, data = data, body = body, method = api.set_permission.method, endpoint = api.set_permission.endpoint( channel, target ) }
 	return json.decode( data )
 end
 	
+function D.getMessages( self, channel, options )
+	local qs = options and '?'..querystring.stringify { before = options.before, after = options.after, limit = options.limit } or ""
+	local head, data = http.request( api.get_messages.method, api.get_messages.endpoint(channel)..qs, self.headers )
+	return json.decode( data )
+end
+
+function D.deleteMessage( self, channel, id )
+	local head, data = http.request( api.delete_message.method, api.delete_message.endpoint(channel,id), self.headers )
+	return json.decode( data )
+end
 
 return setmetatable( {}, { __call = new } )
