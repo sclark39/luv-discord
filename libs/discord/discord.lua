@@ -245,9 +245,9 @@ end
 function connect( self, options )
 	print 'Connecting'
 	local read, write, socket = websocket( self.gateway )
+	write = wrapper.writer(write, function(item) return { opcode = 1, mask = true, payload = item } end ) -- must write using plain/text opcode and with mask enabled
 	self.ws = { socket = socket, read = read, write = write }
 	
-	write = wrapper.writer(write, function(item) return { opcode = 1, mask = true, payload = item } end ) -- must write using plain/text opcode and with mask enabled
 	write( json.stringify
 		{ 
 			op = 2, 
@@ -307,7 +307,7 @@ function init( self, options )
 	self.heartbeat = timer.setInterval( data.d.heartbeat_interval, 
 		coroutine.wrap( function()
 				while true do
-					write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
+					self.ws.write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
 					yield()
 				end
 			end 
