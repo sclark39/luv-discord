@@ -216,14 +216,22 @@ local function new( t, ... )
 	return self
 end
 
+function getauthcache( self )
+	self.token, self.gateway = dofile( "auth-cache.lua" )
+	self.headers = { { "content-type", "application/json" }, { "authorization", self.token } }
+end
+	
+
 function auth( self, options )
+	self.headers = { { "content-type", "application/json" } }
+	
 	do -- auth
 		print 'Authenticating'
 		local body = json.stringify( { email = options.email, password = options.password } )
-		local head, data = http.request( api.login.method, api.login.endpoint(), self.headers, body )
+		local head, data = http.request( api.login.method, api.login.endpoint(), { { "content-type", "application/json" } }, body )		
 		data = json.decode( data )
-		self.headers[#self.headers] = { "authorization",  self.token }
 		self.token = data.token
+		self.headers = { { "content-type", "application/json" }, { "authorization", self.token } }
 	end
 	
 	do -- find gateway
@@ -231,112 +239,126 @@ function auth( self, options )
 		local head, data = http.request( api.gateway.method, api.gateway.endpoint(), self.headers )
 		data = json.decode( data )
 		self.gateway = data.url
+	end	
+end
+
+function connect( self, options )
+	print 'Connecting'
+	local read, write, socket = websocket( self.gateway )
+	self.ws = { socket = socket, read = read, write = write }
+	
+	write = wrapper.writer(write, function(item) return { opcode = 1, mask = true, payload = item } end ) -- must write using plain/text opcode and with mask enabled
+	write( json.stringify
+		{ 
+			op = 2, 
+			d = 
+			{
+				v = 3,
+				token = self.token, 
+				compress = false,
+				properties =
+				{
+					["$os"] = require('ffi').os,
+					["$browser"] = "",
+					["$device"] = "",
+					["$referrer"] = "",
+					["$referring_domain"] = "",
+				}
+			} 
+		}  
+	)
+	
+	local message = read()
+	if message.opcode == 8 then
+		print 'Disconnected'
+		p{ erorr = message.payload }
+		return false, message
 	end
 	
+	-- save working token/gateway
 	local f = io.output( "auth-cache.lua" )
 	f:write( string.format( "return '%s', '%s'", self.token, self.gateway ) )
 	f:close()
+		
+	return true, message
 end
-		
+	
+	
 function init( self, options )
-	self.headers = { { "content-type", "application/json" } }
-	
-	self.token, self.gateway = dofile( "auth-cache.lua" )
-	self.headers[#self.headers + 1] = { "authorization",  self.token }
-	
-	--[[if not socket:is_active() then
+		
+	local success,message
+	if pcall( getauthcache, self ) then
+		success, message = connect( self, options )	
+	end
+	if not success then
 		auth( self, options )
+		success, message = connect( self, options )
 	end
-	]]--
+	if not success then
+		print 'Failed to connect'
+		return
+	end
 	
-	do
-		print 'Connecting'
-		local read, write, socket = websocket( self.gateway )
-		self.socket = socket
+	local data = json.decode( message.payload )
+	assert( data.t == 'READY' )
+	assert( data.d.heartbeat_interval )
+	
+	-- Heartbeat
+	self.heartbeat = timer.setInterval( data.d.heartbeat_interval, 
+		coroutine.wrap( function()
+				while true do
+					write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
+					yield()
+				end
+			end 
+		) 
+	)
+	
+	-- Parse ready message.
+	self.user = data.d.user
+	self.guildChannelLookup = {}
 		
-		write = wrapper.writer(write, function(item) return { opcode = 1, mask = true, payload = item } end ) -- must write using plain/text opcode and with mask enabled
-		write( json.stringify
-			{ 
-				op = 2, 
-				d = 
-				{
-					v = 3,
-					token = self.token, 
-					compress = false,
-					properties =
-					{
-						["$os"] = require('ffi').os,
-						["$browser"] = "",
-						["$device"] = "",
-						["$referrer"] = "",
-						["$referring_domain"] = "",
-					}
-				} 
-			}  
-		)
+	self.guilds = data.d.guilds
+	for i=1,#self.guilds do					
+		local g = self.guilds[i]
 		
-		local message = read()	
+		for i=1,#g.channels do
+			self.guildChannelLookup[ g.channels[i].id ] = g.id
+		end
+		
+		g.channels = DS.fromList( g.channels, 'id', 'name' )
+		g.members = DS.fromList( g.members, 'user.id', 'user.username' )
+		g.presences = nil--DS.fromList( g.presences, 'user.id' )
+		g.roles = DS.fromList( g.roles, 'id', 'name' )			
+	end		
+	self.guilds = DS.fromList( self.guilds, 'id', 'name' )		
+	self.pms = DS.fromList( data.d.private_channels, 'id', 'recipient.id' )
+		
+	trigger( self, 'ready' )
+
+	for message in self.ws.read do
+		while self.threading.busy do 
+			print "waiting to read, busy"
+			self.threading.waiting = true
+			yield() 
+		end
+		self.threading.busy = true
+		
 		local data = json.decode( message.payload )
-		assert( data.t == 'READY' )
-		assert( data.d.heartbeat_interval )
-		
-		-- Heartbeat
-		timer.setInterval( data.d.heartbeat_interval, 
-			coroutine.wrap( function()
-					while true do
-						write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
-						yield()
-					end
-				end 
-			) 
-		)
-		
-		-- Parse data.
-		self.user = data.d.user
-		self.guildChannelLookup = {}
-			
-		self.guilds = data.d.guilds
-		for i=1,#self.guilds do					
-			local g = self.guilds[i]
-			
-			for i=1,#g.channels do
-				self.guildChannelLookup[ g.channels[i].id ] = g.id
-			end
-			
-			g.channels = DS.fromList( g.channels, 'id', 'name' )
-			g.members = DS.fromList( g.members, 'user.id', 'user.username' )
-			g.presences = nil--DS.fromList( g.presences, 'user.id' )
-			g.roles = DS.fromList( g.roles, 'id', 'name' )			
-		end		
-		self.guilds = DS.fromList( self.guilds, 'id', 'name' )		
-		self.pms = DS.fromList( data.d.private_channels, 'id', 'recipient.id' )
-			
-		trigger( self, 'ready' )
-		
-		for message in read do
-			while self.threading.busy do 
-				print "waiting to read, busy"
-				self.threading.waiting = true
-				yield() 
-			end
-			self.threading.busy = true
-			
-			local data = json.decode( message.payload )
-			trigger( self, 'debug', data )
-			if data.d and ws_events[data.t] then
-				ws_events[ data.t ]( self, data.d )
-			end
-						
-			self.threading.busy = false
-			if self.threading.yieldTo then
-				print "done working, yielding to..."
-				local coro = self.threading.yieldTo 
-				self.threading.yieldTo = nil
-				resume( coro )
-			end
-		end	
-		
-	end
+		trigger( self, 'debug', data )
+		if data.d and ws_events[data.t] then
+			ws_events[ data.t ]( self, data.d )
+		end
+					
+		self.threading.busy = false
+		if self.threading.yieldTo then
+			print "done working, yielding to..."
+			local coro = self.threading.yieldTo 
+			self.threading.yieldTo = nil
+			resume( coro )
+		end
+	end	
+	
 end
 
 
