@@ -1,8 +1,7 @@
 local uv = require 'uv'
-local bot =  require 'discord' ( { email = BOT_EMAIL, password = BOT_PASSWORD } )
+local bot = require 'discord' ( { email = BOT_EMAIL, password = BOT_PASSWORD } )
 math.randomseed( os.time() )
 
-bot:on( 'ready', function( self ) print('Connected.') end )
 bot:on( 'message', function( self, user, id, channel, message )
 		print( user .. ": " .. message )
 		local count,sides = message:match("!roll (%d+)d(%d+)")
