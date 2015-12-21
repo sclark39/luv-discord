@@ -29,7 +29,6 @@ local headers =
 
 local HTTP_CREATED = 201
 
-local wrap,yield,resume = coroutine.wrap, coroutine.yield, coroutine.resume
 
 local function EP( s )
 	local split, fill, lastj = {}, {}, 1
@@ -140,7 +139,6 @@ local ws_events =
 			trigger( self, 'message', d.author.username, d.author.id, d.channel_id, d.content ); 
 		end,
 		
-	-- g.presences = DS.fromList( g.presences, 'user.id' )
 	PRESENCE_UPDATE = noop,
 		
 	USER_UPDATE = noop,
@@ -176,8 +174,7 @@ local ws_events =
 			local members = popGuild( self, d ).members
 			DS.remove( members, d.user.id )
 		end,		
-		
-	-- g.roles = DS.fromList( g.roles, 'id', 'name' )		
+			
 	GUILD_ROLE_CREATE = function( self, d )
 			local members = popGuild( self, d ).roles
 			DS.add( members, d.role )
@@ -204,14 +201,8 @@ local function new( t, ... )
 	self.triggerOn = {}
 	self.wpm = 90
 	
-	local init = wrap( init )
-	self.threading = {
-		resume = init,
-		busy = false,
-		block = false,
-		yield = nil,
-	}
-	init( self, options )
+	local init = coroutine.create( init )
+	coroutine.resume( init, self, options )
 	
 	return self
 end
@@ -279,7 +270,9 @@ function connect( self, options )
 	local f = io.output( "auth-cache.lua" )
 	f:write( string.format( "return '%s', '%s'", self.token, self.gateway ) )
 	f:close()
-		
+	
+	print "Connected."
+	
 	return true, message
 end
 	
@@ -308,7 +301,7 @@ function init( self, options )
 		coroutine.wrap( function()
 				while true do
 					self.ws.write( json.stringify( { op = 1, d = os.time() * 1000 } ) ) 
-					yield()
+					coroutine.yield()
 				end
 			end 
 		) 
@@ -336,50 +329,16 @@ function init( self, options )
 		
 	trigger( self, 'ready' )
 
-	for message in self.ws.read do
-		while self.threading.busy do 
-			print "waiting to read, busy"
-			self.threading.waiting = true
-			yield() 
-		end
-		self.threading.busy = true
+	repeat
 		
+		local message = self.ws.read()
 		local data = json.decode( message.payload )
 		trigger( self, 'debug', data )
 		if data.d and ws_events[data.t] then
 			ws_events[ data.t ]( self, data.d )
 		end
-					
-		self.threading.busy = false
-		if self.threading.yieldTo then
-			print "done working, yielding to..."
-			local coro = self.threading.yieldTo 
-			self.threading.yieldTo = nil
-			resume( coro )
-		end
-	end	
-	
-end
-
-
-function D.lock( self )
-	print "lock"
-	if self.threading.busy then
-		self.threading.yieldTo = coroutine.running()
-		print "yielding timer"
-		coroutine.yield()
-	end
-	self.threading.busy = true
-end
-
-function D.unlock( self )
-	print "unlock"
-	self.threading.busy = false
-	if self.threading.waiting then
-		self.threading.waiting = nil
-		print "resuming main"
-		self.threading.resume()
-	end
+		
+	until nil
 end
 
 function trigger(self,event,...)
@@ -401,7 +360,7 @@ end
 	
 function D.fakeType( self, channel, sleep_time )
 	repeat
-		http.request( api.broadcast_typing.method, api.broadcast_typing.endpoint(channel), self.headers )
+		local head, data = http.request( api.broadcast_typing.method, api.broadcast_typing.endpoint(channel), self.headers )
 		timer.sleep( math.min( 5000, sleep_time ) )
 		sleep_time = sleep_time - 5000
 	until sleep_time <= 0
@@ -413,8 +372,7 @@ function D.sendMessage( self, channel, message, options )
 		self:fakeType( channel, typing_time )
 	end
 	local body = json.stringify(  { content = message } )
-	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )	
-	
+	local head, data = http.request( api.send_message.method, api.send_message.endpoint(channel), self.headers, body )		
 	if head.code == 429 then
 		data = json.decode( data  )
 		print( 'Rate limit hit. Sleeping for ' .. data['retry_after'] .. 'ms.' )
