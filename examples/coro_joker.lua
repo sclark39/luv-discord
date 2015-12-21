@@ -38,7 +38,7 @@ local main = coroutine.create( function( self )
 		timeout( 10 * 1000 ) 
 		repeat event, args = read( self ) until
 			event == "timeout" or 
-			event == "message" and args.id == targetUser and args.channel == targetChannel )
+			event == "message" and args.id == targetUser and args.channel == targetChannel
 		clear_timeout() 
 		
 		if event == "timeout" then
